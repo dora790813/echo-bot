@@ -47,7 +47,7 @@ let appSettings = {};
 // 監聽近期訂單 (計入 Read)
 const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
 db.collection('reservations').where('timestamp', '>=', ninetyDaysAgo).onSnapshot(snapshot => {
-    addDbStat('read', snapshot.docChanges().length); // 每次只計算有異動的文檔數量
+    addDbStat('read', snapshot.docChanges().length); 
     allReservations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 });
 
@@ -730,7 +730,7 @@ client.on('interactionCreate', async interaction => {
             if (interaction.commandName === '預約') {
                 const location = interaction.options.getString('地點');
                 const tw = getTaiwanTime();
-                const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
+                const modal = new ModalBuilder().setCustomId(`reserve_${location}_1`).setTitle(`📝 預約：${location}`);
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
@@ -1171,11 +1171,28 @@ client.on('interactionCreate', async interaction => {
         }
         else if (interaction.isStringSelectMenu() && interaction.customId === 'select_location') {
             const location = interaction.values[0];
+            const timesRow = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder().setCustomId(`select_times_${location}`).setPlaceholder('請選擇連續施放次數 (預設1次)')
+                .addOptions([
+                    { label: '1 次 (單場施放)', value: '1' },
+                    { label: '2 次 (共 80 分鐘)', value: '2' },
+                    { label: '3 次 (共 120 分鐘)', value: '3' },
+                    { label: '4 次 (共 160 分鐘)', value: '4' },
+                    { label: '5 次 (共 200 分鐘)', value: '5' },
+                    { label: '6 次 (共 240 分鐘)', value: '6' }
+                ])
+            );
+            await interaction.update({ content: `👇 **已選擇【${location}】。請接著選擇要連續施放的「次數」：**`, components: [timesRow] });
+        }
+        else if (interaction.isStringSelectMenu() && interaction.customId.startsWith('select_times_')) {
+            const location = interaction.customId.split('_')[2];
+            const times = interaction.values[0];
             const tw = getTaiwanTime();
-            const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
+            
+            const modal = new ModalBuilder().setCustomId(`reserve_${location}_${times}`).setTitle(`📝 預約：${location} (連續 ${times} 次)`);
             modal.addComponents(
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("首場日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("首場時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("預約者遊戲ID").setStyle(TextInputStyle.Short).setRequired(true)),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false)), 
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false))
@@ -1214,77 +1231,109 @@ client.on('interactionCreate', async interaction => {
                 await interaction.message.delete().catch(() => {});
             }
 
-            const location = interaction.customId.split('_')[1];
+            const parts = interaction.customId.split('_');
+            const location = parts[1];
+            const times = parseInt(parts[2] || '1', 10);
+
             let date = interaction.fields.getTextInputValue('date');
             let time = interaction.fields.getTextInputValue('time');
             const gameId = interaction.fields.getTextInputValue('gameId');
             const channel = interaction.fields.getTextInputValue('channel') || ''; 
-            const notes = interaction.fields.getTextInputValue('notes') || '無';
+            const baseNotes = interaction.fields.getTextInputValue('notes') || '無';
             
             const { formattedDate, formattedTime, parsedDate } = formatDateTimeStr(date, time);
-            date = formattedDate;
-            time = formattedTime;
             const newDateTime = parsedDate;
 
             if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式（例如：2026-08-18 14:30）。' });
             if (newDateTime.getTime() <= Date.now()) return interaction.editReply({ content: '❌ **無法預約過去的時間**。' });
 
-            const isConflict = allReservations.some(res => res.location === location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
-            if (isConflict) return interaction.editReply({ content: '❌ 此時段前後10分鐘已有排單，請重新調整喔。' });
-
             const opMode = appSettings['operationMode'] || {};
             const frozenSlots = opMode.frozenSlots || [];
             const autoApprove = opMode.autoApprove || false;
 
-            if (isTimeFrozen(time, frozenSlots)) {
-                return interaction.editReply({ content: `❌ **系統凍結時段**：此時段（${time}）暫不開放預約，請選擇其他時間喔！` });
+            let scheduledSlots = [];
+            for (let i = 0; i < times; i++) {
+                const targetTimeMs = newDateTime.getTime() + (i * 40 * 60 * 1000);
+                const targetObj = new Date(targetTimeMs + 8 * 60 * 60 * 1000); 
+                
+                const tDate = `${targetObj.getUTCFullYear()}-${String(targetObj.getUTCMonth()+1).padStart(2,'0')}-${String(targetObj.getUTCDate()).padStart(2,'0')}`;
+                const tTime = `${String(targetObj.getUTCHours()).padStart(2,'0')}:${String(targetObj.getUTCMinutes()).padStart(2,'0')}`;
+
+                if (isTimeFrozen(tTime, frozenSlots)) {
+                    return interaction.editReply({ content: `❌ **系統凍結時段**：第 ${i+1} 場（${tTime}）暫不開放預約，請重新選擇首場時間！` });
+                }
+
+                const isConflict = allReservations.some(res => res.location === location && Math.abs(targetTimeMs - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
+                if (isConflict) {
+                    return interaction.editReply({ content: `❌ **時段衝突**：第 ${i+1} 場（${tTime}）前後10分鐘已有排單，無法完成連續預約。` });
+                }
+
+                scheduledSlots.push({ targetTimeMs, tDate, tTime });
             }
 
-            const data = {
-                discordId: interaction.user.id, 
-                discordName: interaction.user.displayName || interaction.user.username,
-                gameId, date, time, location, channel, notes,
-                timestamp: newDateTime.getTime(), reminded: false, takenBy: null, postChecked: false, userDmMsgId: null, buttonsRemoved: false,
-                status: autoApprove ? 'approved' : 'pending',
-                reviewer: autoApprove ? '系統自動' : null
-            };
-            const docRef = await db.collection('reservations').add(data);
-            addDbStat('write');
-            data.id = docRef.id;
-
-            const payload = buildTicketPayload(docRef.id, data);
-            const sentMsgs = await broadcastToManagementAreas(payload);
-            await docRef.update({ ticketMsgs: sentMsgs });
-            addDbStat('write');
-
-            const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger));
+            let dmEmbedDesc = "";
             
-            if (autoApprove) {
-                const btnRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`edit_${docRef.id}`).setLabel('✏️ 變更登記資料').setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
-                );
-                const dmEmbed = new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 預約已自動通過').setDescription(`系統已自動審核通過您的訂單，並排入班表！\n**地點**：${location}\n**時間**：${date} ${time}`);
-                try {
-                    const dmMsg = await interaction.user.send({ embeds: [dmEmbed], components: [btnRow] });
-                    await docRef.update({ userDmMsgId: dmMsg.id });
-                    addDbStat('write');
-                    await interaction.editReply({ content: `✅ **預約成功！** 系統已自動審核通過，請查看 DM 確認。` });
-                } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
-                }
-                updateBoard();
-            } else {
-                const dmEmbed = new EmbedBuilder().setColor(0xFFA500).setTitle('⏳ 預約等待審核中').setDescription(`您的訂單已送出，等待管理員審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
-                try {
-                    const dmMsg = await interaction.user.send({ embeds: [dmEmbed], components: [cancelRow] });
-                    await docRef.update({ userDmMsgId: dmMsg.id });
-                    addDbStat('write');
-                    await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
-                } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
+            for (let i = 0; i < times; i++) {
+                const slot = scheduledSlots[i];
+                const notes = times > 1 ? `${baseNotes} (連放 ${i+1}/${times})` : baseNotes;
+
+                const data = {
+                    discordId: interaction.user.id, 
+                    discordName: interaction.user.displayName || interaction.user.username,
+                    gameId, date: slot.tDate, time: slot.tTime, location, channel, notes,
+                    timestamp: slot.targetTimeMs, reminded: false, takenBy: null, postChecked: false, userDmMsgId: null, buttonsRemoved: false,
+                    status: autoApprove ? 'approved' : 'pending',
+                    reviewer: autoApprove ? '系統自動' : null
+                };
+                
+                const docRef = await db.collection('reservations').add(data);
+                addDbStat('write');
+                data.id = docRef.id;
+
+                const payload = buildTicketPayload(docRef.id, data);
+                const sentMsgs = await broadcastToManagementAreas(payload);
+                await docRef.update({ ticketMsgs: sentMsgs });
+                addDbStat('write');
+
+                dmEmbedDesc += `> 第 ${i+1} 場：\`${slot.tDate} ${slot.tTime}\`\n`;
+
+                if (times === 1) {
+                    const btnRow = autoApprove 
+                        ? new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId(`edit_${docRef.id}`).setLabel('✏️ 變更登記資料').setStyle(ButtonStyle.Success),
+                            new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
+                          )
+                        : new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger));
+                    
+                    const dmEmbed = new EmbedBuilder()
+                        .setColor(autoApprove ? 0x00FF00 : 0xFFA500)
+                        .setTitle(autoApprove ? '✅ 預約已自動通過' : '⏳ 預約等待審核中')
+                        .setDescription(autoApprove ? `系統已自動審核通過您的訂單！\n**地點**：${location}\n**時間**：${date} ${time}` : `您的訂單已送出，等待審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
+                    
+                    try {
+                        const dmMsg = await interaction.user.send({ embeds: [dmEmbed], components: [btnRow] });
+                        await docRef.update({ userDmMsgId: dmMsg.id });
+                        addDbStat('write');
+                    } catch (e) {}
                 }
             }
+
+            if (times > 1) {
+                const batchEmbed = new EmbedBuilder()
+                    .setColor(autoApprove ? 0x00FF00 : 0xFFA500)
+                    .setTitle(autoApprove ? `✅ 連續預約已自動通過 (共 ${times} 場)` : `⏳ 連續預約等待審核中 (共 ${times} 場)`)
+                    .setDescription(`**地點**：${location}\n\n**施放時段**：\n${dmEmbedDesc}\n\n*(💡 註：連續預約將拆分為獨立訂單發包，若需取消或變更請聯繫管理員處理)*`);
+                
+                try { await interaction.user.send({ embeds: [batchEmbed] }); } catch (e) {}
+            }
+
+            const replyMsg = autoApprove 
+                ? `✅ **預約成功！** 共產生 ${times} 筆訂單，系統已自動審核通過，請查看 DM 確認。`
+                : `✅ 預約已送出！共 ${times} 筆訂單，請查看 DM 等待審核結果。`;
+            
+            await interaction.editReply({ content: replyMsg });
+            
+            if (autoApprove) updateBoard();
         }
 
         else if (interaction.isStringSelectMenu() && interaction.customId.startsWith('rejectReason_')) {
