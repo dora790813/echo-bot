@@ -7,9 +7,21 @@ const {
 } = require('discord.js');
 
 // ==========================================
-// 0. 授權伺服器白名單設定
+// 0. 授權伺服器與身分組擴充設定
 // ==========================================
 const ALLOWED_GUILDS = ['1466073297169940543', '1536011422323179631', '1536416054832799795']; 
+
+// 專員身分組映射表 (支援多伺服器擴充)
+const AGENT_ROLE_MAP = {
+    'default': '1541411576228093963', // 您提供的預設迴響專員身分組 ID
+    // 擴充範例：若有其他伺服器要使用不同身分組，請依照下方格式新增
+    // '1466073297169940543': '該伺服器的專員身分組ID',
+};
+
+// 取得該伺服器對應的專員身分組
+function getAgentRoleId(guildId) {
+    return AGENT_ROLE_MAP[guildId] || AGENT_ROLE_MAP['default'];
+}
 
 // ==========================================
 // 資料庫用量追蹤系統 (內部計數器)
@@ -68,7 +80,7 @@ app.listen(port, () => console.log(`[Web Server] Listening on port ${port}`));
 // ==========================================
 // 3. Discord 機器人核心邏輯
 // ==========================================
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages], partials: [Partials.Channel] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMembers], partials: [Partials.Channel] });
 
 const publicBoardIntro = "🎉 **歡迎來到迴響預約中心！**\n為了出團順暢，請提早預約您的專屬迴響時段。\n👇 請點擊下方 **【📝 預約迴響時間】** 快速排單，系統將會為您登記並通知審核！";
 const reserveBtnRow = new ActionRowBuilder().addComponents(
@@ -801,11 +813,22 @@ client.on('interactionCreate', async interaction => {
                 await db.collection('users').doc(targetUser.id).set({ isAgent: true, agentStatus: 'approved' }, { merge: true });
                 addDbStat('write');
                 
+                // 自動發放 Discord 伺服器身分組
+                try {
+                    const member = await interaction.guild.members.fetch(targetUser.id);
+                    const roleId = getAgentRoleId(interaction.guildId);
+                    if (member && roleId) {
+                        await member.roles.add(roleId);
+                    }
+                } catch (e) {
+                    console.error('給予身分組失敗：', e);
+                }
+
                 try {
                     await targetUser.send('🎉 **恭喜！管理員已直接指定您為【迴響專員】囉！**\n您可以開始至頻道接單了！');
                 } catch (e) {}
                 
-                return interaction.editReply(`✅ 已成功指定 <@${targetUser.id}> 為迴響專員。`);
+                return interaction.editReply(`✅ 已成功指定 <@${targetUser.id}> 為迴響專員，並已自動配發身分組。`);
             }
             else if (interaction.commandName === '刪除迴響專員') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
@@ -813,7 +836,19 @@ client.on('interactionCreate', async interaction => {
                 
                 await db.collection('users').doc(targetUser.id).set({ isAgent: false, agentStatus: 'removed' }, { merge: true });
                 addDbStat('write');
-                return interaction.editReply(`✅ 已成功移除 <@${targetUser.id}> 的迴響專員身分。`);
+
+                // 自動回收 Discord 伺服器身分組
+                try {
+                    const member = await interaction.guild.members.fetch(targetUser.id);
+                    const roleId = getAgentRoleId(interaction.guildId);
+                    if (member && roleId) {
+                        await member.roles.remove(roleId);
+                    }
+                } catch (e) {
+                    console.error('移除身分組失敗：', e);
+                }
+
+                return interaction.editReply(`✅ 已成功移除 <@${targetUser.id}> 的迴響專員身分，並已自動撤銷身分組。`);
             }
             else if (interaction.commandName === '刪除訂單') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
@@ -1360,11 +1395,23 @@ client.on('interactionCreate', async interaction => {
                 await db.collection('users').doc(docId).set({ isAgent: true, agentStatus: 'approved' }, { merge: true });
                 addDbStat('write');
                 await interaction.message.edit({ embeds: [new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 專員申請已通過').setDescription(`<@${docId}> 已正式成為認證專員 (審核者：<@${interaction.user.id}>)`)], components: [] });
+                
+                // 自動發放 Discord 伺服器身分組
+                try {
+                    const member = await interaction.guild.members.fetch(docId);
+                    const roleId = getAgentRoleId(interaction.guildId);
+                    if (member && roleId) {
+                        await member.roles.add(roleId);
+                    }
+                } catch (e) {
+                    console.error('給予身分組失敗：', e);
+                }
+
                 try {
                     const targetUser = await client.users.fetch(docId);
                     await targetUser.send('🎉 **恭喜！管理員已通過您的申請，您現在正式成為【迴響專員】囉！**\n您可以開始至頻道接單了！');
                 } catch(e) {}
-                return interaction.reply({ content: '✅ 審核完成。', ephemeral: true });
+                return interaction.reply({ content: '✅ 審核完成，已配發身分組。', ephemeral: true });
             }
 
             if (action === 'rejectAgent') {
