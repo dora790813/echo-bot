@@ -13,9 +13,7 @@ const ALLOWED_GUILDS = ['1466073297169940543', '1536011422323179631', '153641605
 
 // 專員身分組映射表 (支援多伺服器擴充)
 const AGENT_ROLE_MAP = {
-    'default': '1541411576228093963', // 您提供的預設迴響專員身分組 ID
-    // 擴充範例：若有其他伺服器要使用不同身分組，請依照下方格式新增
-    // '1466073297169940543': '該伺服器的專員身分組ID',
+    'default': '1541411576228093963', 
 };
 
 // 取得該伺服器對應的專員身分組
@@ -813,7 +811,6 @@ client.on('interactionCreate', async interaction => {
                 await db.collection('users').doc(targetUser.id).set({ isAgent: true, agentStatus: 'approved' }, { merge: true });
                 addDbStat('write');
                 
-                // 自動發放 Discord 伺服器身分組
                 try {
                     const member = await interaction.guild.members.fetch(targetUser.id);
                     const roleId = getAgentRoleId(interaction.guildId);
@@ -837,7 +834,6 @@ client.on('interactionCreate', async interaction => {
                 await db.collection('users').doc(targetUser.id).set({ isAgent: false, agentStatus: 'removed' }, { merge: true });
                 addDbStat('write');
 
-                // 自動回收 Discord 伺服器身分組
                 try {
                     const member = await interaction.guild.members.fetch(targetUser.id);
                     const roleId = getAgentRoleId(interaction.guildId);
@@ -1033,17 +1029,20 @@ client.on('interactionCreate', async interaction => {
             }
             else if (interaction.commandName === '迴響管理區') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                let channels = appSettings['managementArea']?.channels || [];
+                
+                // 這裡加入了陣列展開運算子，確保不直接修改快取物件，解決無法正常使用的問題
+                let channels = [...(appSettings['managementArea']?.channels || [])];
+                
                 if (channels.includes(interaction.channelId)) {
                     channels = channels.filter(id => id !== interaction.channelId);
                     await db.collection('settings').doc('managementArea').set({ channels });
                     addDbStat('write');
-                    return interaction.editReply({ content: '✅ 已移除迴響管理區。' });
+                    return interaction.editReply({ content: '✅ 已成功移除迴響管理區。' });
                 } else {
                     channels.push(interaction.channelId);
                     await db.collection('settings').doc('managementArea').set({ channels });
                     addDbStat('write');
-                    return interaction.editReply({ content: '✅ **設定成功！**' });
+                    return interaction.editReply({ content: '✅ **迴響管理區設定成功！**' });
                 }
             }
             else if (interaction.commandName === '設定公開看板') {
@@ -1396,7 +1395,6 @@ client.on('interactionCreate', async interaction => {
                 addDbStat('write');
                 await interaction.message.edit({ embeds: [new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 專員申請已通過').setDescription(`<@${docId}> 已正式成為認證專員 (審核者：<@${interaction.user.id}>)`)], components: [] });
                 
-                // 自動發放 Discord 伺服器身分組
                 try {
                     const member = await interaction.guild.members.fetch(docId);
                     const roleId = getAgentRoleId(interaction.guildId);
@@ -1699,6 +1697,9 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
+// ==========================================
+// 啟動 Discord 機器人
+// ==========================================
 client.login(process.env.DISCORD_TOKEN).then(() => {
     console.log('✅ Discord Token 驗證成功，正在登入...');
 }).catch(error => {
