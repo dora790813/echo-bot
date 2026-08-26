@@ -16,7 +16,6 @@ const AGENT_ROLE_MAP = {
     'default': '1541411576228093963', 
 };
 
-// 取得該伺服器對應的專員身分組
 function getAgentRoleId(guildId) {
     return AGENT_ROLE_MAP[guildId] || AGENT_ROLE_MAP['default'];
 }
@@ -54,14 +53,14 @@ console.log('✅ Firebase 資料庫連線成功！');
 let allReservations = [];
 let appSettings = {};
 
-// 監聽近期訂單 (計入 Read)
+// 監聽近期訂單
 const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
 db.collection('reservations').where('timestamp', '>=', ninetyDaysAgo).onSnapshot(snapshot => {
     addDbStat('read', snapshot.docChanges().length); 
     allReservations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 });
 
-// 監聽設定檔 (計入 Read)
+// 監聽設定檔
 db.collection('settings').onSnapshot(snapshot => {
     addDbStat('read', snapshot.docChanges().length);
     snapshot.docs.forEach(doc => { appSettings[doc.id] = doc.data(); });
@@ -114,12 +113,26 @@ function getBoardContentWithTime() {
     return publicBoardIntro;
 }
 
-function isTimeFrozen(timeStr, frozenSlots) {
+// 判斷某日是否為週末(六、日)
+function isWeekend(dateStr) {
+    const [y, m, d] = dateStr.split('-');
+    const dt = new Date(Date.UTC(y, m - 1, d, 4, 0, 0)); // 避免時區問題，固定取該日中午判定
+    const day = dt.getUTCDay();
+    return day === 0 || day === 6;
+}
+
+// 根據平假日判定是否在凍結時間內
+function isTimeFrozen(timeStr, frozenSlots, dateStr) {
     if (!frozenSlots || frozenSlots.length === 0) return false;
     const [h, m] = timeStr.split(':').map(Number);
     const tMins = h * 60 + m;
+    const isWknd = isWeekend(dateStr);
 
     for (const slot of frozenSlots) {
+        const sType = slot.type || 'all'; // 兼容舊資料
+        if (sType === 'weekday' && isWknd) continue;
+        if (sType === 'weekend' && !isWknd) continue;
+
         const [sh, sm] = slot.start.split(':').map(Number);
         const [eh, em] = slot.end.split(':').map(Number);
         const startMins = sh * 60 + sm;
@@ -132,6 +145,33 @@ function isTimeFrozen(timeStr, frozenSlots) {
         }
     }
     return false;
+}
+
+// 取得該日的所有凍結時段說明字串
+function getFrozenTextForDateStr(frozenSlots, dateStr) {
+    if (!frozenSlots || frozenSlots.length === 0) return "無暫停時段";
+    const isWknd = isWeekend(dateStr);
+    
+    let applicable = frozenSlots.filter(s => {
+        const sType = s.type || 'all';
+        if (sType === 'weekday' && isWknd) return false;
+        if (sType === 'weekend' && !isWknd) return false;
+        return true;
+    });
+    
+    if (applicable.length === 0) return "無暫停時段";
+    
+    return applicable.map(s => {
+        const [sh, sm] = s.start.split(':').map(Number);
+        const [eh, em] = s.end.split(':').map(Number);
+        const startMins = sh * 60 + sm;
+        const endMins = eh * 60 + em;
+        if (startMins > endMins) {
+            return `於 \`${s.start}\` 至明日 \`${s.end}\` 暫停系統預約`;
+        } else {
+            return `於 \`${s.start}\` 至 \`${s.end}\` 暫停系統預約`;
+        }
+    }).join('、');
 }
 
 async function addViolation(discordId) {
@@ -372,7 +412,16 @@ function generateScheduleEmbed(reservations, isAdmin = false, page = 1, isComman
         }
     }
 
+    // 於公開看板底部顯示當日凍結規則提示
     if (!isCommand) {
+        const opMode = appSettings['operationMode'] || {};
+        const fSlots = opMode.frozenSlots || [];
+        if (fSlots.length > 0 && !isAdmin) {
+            const todayFrozenText = getFrozenTextForDateStr(fSlots, todayStr);
+            if (todayFrozenText !== "無暫停時段") {
+                scheduleText += `\n⚠️ **【今日系統預約限制】**\n${todayFrozenText}\n\n`;
+            }
+        }
         scheduleText += `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
     }
 
@@ -591,7 +640,11 @@ client.once('clientReady', async () => {
             options: [
                 { name: '自動審核', type: 1, description: '開啟或關閉自動審核', options: [{ name: '狀態', type: 3, description: '是否開啟自動審核', required: true, choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] }] },
                 { name: '自動更新看板', type: 1, description: '每分鐘自動刷新看板時間 (注意資源額度)', options: [{ name: '狀態', type: 3, description: '是否開啟自動更新', required: true, choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] }] },
-                { name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', options: [{ name: '開始時間', type: 3, description: '例如 02:00', required: true }, { name: '結束時間', type: 3, description: '例如 10:00', required: true }] },
+                { name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', options: [
+                    { name: '類型', type: 3, description: '適用日', required: true, choices: [ { name: '平日 (週一至週五)', value: 'weekday' }, { name: '假日 (週六與週日)', value: 'weekend' }, { name: '不分平假日', value: 'all' } ] },
+                    { name: '開始時間', type: 3, description: '例如 23:00', required: true }, 
+                    { name: '結束時間', type: 3, description: '例如 08:00', required: true }
+                ]},
                 { name: '清空凍結時段', type: 1, description: '清除所有已設定的凍結時段' },
                 { name: '查看目前設定', type: 1, description: '查看自動審核狀態與凍結時段' }
             ]
@@ -990,16 +1043,18 @@ client.on('interactionCreate', async interaction => {
                     addDbStat('write');
                     return interaction.editReply(`✅ 已將「自動更新看板」狀態設定為：**${state ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (手動刷新)'}**`);
                 } else if (sub === '新增凍結時段') {
+                    const type = interaction.options.getString('類型');
                     const start = interaction.options.getString('開始時間');
                     const end = interaction.options.getString('結束時間');
                     if (!/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) {
                         return interaction.editReply('❌ 格式錯誤，請輸入例如 `02:00` 的格式喔！');
                     }
                     if (!opData.frozenSlots) opData.frozenSlots = [];
-                    opData.frozenSlots.push({ start, end });
+                    opData.frozenSlots.push({ type, start, end });
                     await docRef.set(opData, { merge: true });
                     addDbStat('write');
-                    return interaction.editReply(`✅ 已新增凍結時段：\`${start}\` 到 \`${end}\` 期間將自動阻擋預約。`);
+                    const typeStr = type === 'weekday' ? '平日' : (type === 'weekend' ? '假日' : '平假日');
+                    return interaction.editReply(`✅ 已新增凍結時段：${typeStr} \`${start}\` 到 \`${end}\` 期間將自動阻擋預約。`);
                 } else if (sub === '清空凍結時段') {
                     opData.frozenSlots = [];
                     await docRef.set(opData, { merge: true });
@@ -1010,7 +1065,10 @@ client.on('interactionCreate', async interaction => {
                     desc += `**自動更新看板**：${opData.autoRefreshBoard ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (手動刷新)'}\n\n`;
                     desc += `**目前凍結時段**：\n`;
                     if (opData.frozenSlots && opData.frozenSlots.length > 0) {
-                        opData.frozenSlots.forEach(s => desc += `> 🛑 \`${s.start}\` ~ \`${s.end}\`\n`);
+                        opData.frozenSlots.forEach(s => {
+                            const sType = s.type === 'weekday' ? '平日' : (s.type === 'weekend' ? '假日' : '平假日');
+                            desc += `> 🛑 [${sType}] \`${s.start}\` ~ \`${s.end}\`\n`;
+                        });
                     } else {
                         desc += '> 無凍結時段';
                     }
@@ -1030,7 +1088,6 @@ client.on('interactionCreate', async interaction => {
             else if (interaction.commandName === '迴響管理區') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 
-                // 這裡加入了陣列展開運算子，確保不直接修改快取物件，解決無法正常使用的問題
                 let channels = [...(appSettings['managementArea']?.channels || [])];
                 
                 if (channels.includes(interaction.channelId)) {
@@ -1293,8 +1350,9 @@ client.on('interactionCreate', async interaction => {
                 const tDate = `${targetObj.getUTCFullYear()}-${String(targetObj.getUTCMonth()+1).padStart(2,'0')}-${String(targetObj.getUTCDate()).padStart(2,'0')}`;
                 const tTime = `${String(targetObj.getUTCHours()).padStart(2,'0')}:${String(targetObj.getUTCMinutes()).padStart(2,'0')}`;
 
-                if (isTimeFrozen(tTime, frozenSlots)) {
-                    return interaction.editReply({ content: `❌ **系統凍結時段**：第 ${i+1} 場（${tTime}）暫不開放預約，請重新選擇首場時間！` });
+                if (isTimeFrozen(tTime, frozenSlots, tDate)) {
+                    const frozenMsg = getFrozenTextForDateStr(frozenSlots, tDate);
+                    return interaction.editReply({ content: `❌ **系統凍結時段**：第 ${i+1} 場（${tDate} \`${tTime}\`）為暫不開放預約時段！\n📌 該日暫停時段說明：${frozenMsg}\n請重新選擇首場時間喔！` });
                 }
 
                 const isConflict = allReservations.some(res => res.location === location && Math.abs(targetTimeMs - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
@@ -1632,8 +1690,9 @@ client.on('interactionCreate', async interaction => {
             const frozenSlots = opMode.frozenSlots || [];
             const autoApprove = opMode.autoApprove || false;
 
-            if (isTimeFrozen(newTime, frozenSlots)) {
-                return interaction.followUp({ content: `❌ **系統凍結時段**：此時段（${newTime}）暫不開放預約，請選擇其他時間喔！`, ephemeral: true });
+            if (isTimeFrozen(newTime, frozenSlots, newDate)) {
+                const frozenMsg = getFrozenTextForDateStr(frozenSlots, newDate);
+                return interaction.followUp({ content: `❌ **系統凍結時段**：此時段（${newTime}）為暫不開放預約時段！\n📌 該日暫停時段說明：${frozenMsg}\n請選擇其他時間喔！`, ephemeral: true });
             }
 
             const currentDoc = await db.collection('reservations').doc(docId).get();
